@@ -1,6 +1,7 @@
 import os
 import json
 import subprocess
+import datetime
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import PromptSession
@@ -69,14 +70,16 @@ def get_menu_choice(options, message):
 def chat_cli():
     messages = load_history()
     
-    agent_manual = load_system_prompt()
+    agent_manual_template = load_system_prompt()
     
-    if agent_manual:
-        # Remove any old system prompts before adding the new one
+    if agent_manual_template:
+        current_date = datetime.datetime.now().strftime("%Y年%m月%d日")
+        agent_manual = agent_manual_template.replace("{{CURRENT_DATE}}", current_date)
+
         messages = [m for m in messages if m['role'] != 'system']
         messages.insert(0, {"role": "system", "content": agent_manual})
 
-    print("Chat history loaded. The AI can now search the web and execute commands (with your approval).")
+    print("Chat history loaded. Type '/exit' to quit.")
     print("Press Alt+Enter for a new line. Press Enter to send. Press Ctrl+C or Ctrl+D to exit.")
 
     bindings = KeyBindings()
@@ -97,75 +100,85 @@ def chat_cli():
             print("\nChat history saved. Goodbye!")
             break
 
+        if user_input.strip().lower() == '/exit':
+            save_history(messages)
+            print("\nChat history saved. Goodbye!")
+            break
+
         if not user_input.strip():
             continue
 
         messages.append({"role": "user", "content": user_input})
 
-        while True:
-            response_message = send_message(messages)
-            response_content = response_message.content
+        # Initial call to get the LLM's plan
+        response_message = send_message(messages, perform_search=False)
 
-            if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": response_content if response_content else "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": tc.type,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        } for tc in response_message.tool_calls
-                    ]
-                })
+        # Check if the LLM wants to use a tool
+        if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
+            # Add the assistant's decision to the history
+            messages.append({
+                "role": "assistant",
+                "content": response_message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    } for tc in response_message.tool_calls
+                ]
+            })
 
-                tool_output_messages = []
-                for tool_call in response_message.tool_calls:
-                    function_name = tool_call.function.name
-                    arguments = json.loads(tool_call.function.arguments)
+            # Process tool calls
+            for tool_call in response_message.tool_calls:
+                function_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
 
-                    if function_name == "execute_shell_command":
-                        command = arguments.get("command")
-                        if command:
-                            print(f"\nLLM wants to execute the following command: `{command}`")
-                            choice = get_menu_choice(["Allow", "Deny"], "Choose an action:")
-
-                            if choice == 1:
-                                try:
-                                    print(f"Executing: {command}")
-                                    result = subprocess.run(
-                                        command,
-                                        shell=True,
-                                        capture_output=True,
-                                        text=True,
-                                        cwd=os.getcwd(),
-                                        check=False
-                                    )
-                                    tool_output = f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
-                                except Exception as e:
-                                    tool_output = f"Error executing command: {e}"
-                            elif choice == 2:
-                                tool_output = "User denied command execution."
-                            else:
-                                tool_output = "Command execution cancelled by user."
-                        else:
-                            tool_output = "LLM requested to execute an empty command."
-                    else:
-                        tool_output = f"Unknown tool requested: {function_name}"
-
-                    tool_output_messages.append({
+                if function_name == "perform_web_search":
+                    topic = arguments.get("topic")
+                    print(f"LLM has decided to search for topics related to: \"{topic}\"")
+                    # Add a dummy tool response to acknowledge
+                    messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": tool_output
+                        "content": f"Proceeding with web search for topic: {topic}"
                     })
-                
-                messages.extend(tool_output_messages)
-            else:
-                break
+                    # Make the second call with web search enabled
+                    final_response_message = send_message(messages, perform_search=True)
+
+                elif function_name == "execute_shell_command":
+                    command = arguments.get("command")
+                    tool_output = ""
+                    if command:
+                        print(f"\nLLM wants to execute the following command: `{command}`")
+                        choice = get_menu_choice(["Allow", "Deny"], "Choose an action:")
+                        if choice == 1:
+                            try:
+                                print(f"Executing: {command}")
+                                result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=os.getcwd(), check=False)
+                                tool_output = f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+                            except Exception as e:
+                                tool_output = f"Error executing command: {e}"
+                        elif choice == 2:
+                            tool_output = "User denied command execution."
+                        else:
+                            tool_output = "Command execution cancelled by user."
+                    else:
+                        tool_output = "LLM requested to execute an empty command."
+                    
+                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_output})
+                    # Make the second call to get the LLM's summary
+                    final_response_message = send_message(messages, perform_search=False)
+                else:
+                    final_response_message = response_message # Unknown tool, do nothing
+
+            response_message = final_response_message
         
+        # Process and print the final response for the turn
+        response_content = response_message.content
+
         if hasattr(response_message, 'annotations') and response_message.annotations:
             print("--- Sources ---")
             for i, annotation in enumerate(response_message.annotations, 1):
@@ -176,6 +189,7 @@ def chat_cli():
 
         print("LLM:", response_content)
 
+        # Add the final assistant message to history
         assistant_message = {"role": "assistant"}
         if response_content:
             assistant_message["content"] = response_content
