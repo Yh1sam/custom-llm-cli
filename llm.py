@@ -15,12 +15,35 @@ def send_message(messages, model="openai/gpt-4o", attachments=None):
     body = {
         "model": model,
         "messages": messages,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_shell_command",
+                    "description": "Executes a shell command in the current directory and returns the output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The shell command to execute."
+                            }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            }
+        ]
     }
+    
+    extra_body = {"plugins": [{"id": "web"}]}
+
     if attachments:
         body["attachments"] = attachments
 
     completion = client.chat.completions.create(
         **body,
+        extra_body=extra_body,
         extra_headers=extra_headers,
     )
-    return completion.choices[0].message.content
+    return completion.choices[0].message
