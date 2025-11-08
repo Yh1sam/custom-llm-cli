@@ -1,4 +1,4 @@
 from cli import chat_cli
 
 if __name__ == "__main__":
-    chat_cli()  
+    chat_cli()      
