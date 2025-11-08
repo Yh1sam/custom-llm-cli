@@ -2,11 +2,10 @@ import os
 import json
 import subprocess
 import datetime
-from prompt_toolkit import prompt
-from prompt_toolkit.key_binding import KeyBindings
 from llm import send_message
 from session import ChatSession
 from config import PROMPT_FILE
+from tui import ChatApp
 
 def load_system_prompt():
     try:
@@ -16,122 +15,126 @@ def load_system_prompt():
         print(f"Warning: Prompt file '{PROMPT_FILE}' not found. Continuing without a system prompt.")
         return None
 
-def get_menu_choice(options, message):
-    # This function is no longer used in the reverted CLI, but kept for potential future use.
-    pass
+class ChatManager:
+    def __init__(self):
+        self.session = ChatSession()
+        self.agent_manual_template = load_system_prompt()
+        self.app = None
+        self.apply_system_prompt()
+        self._tool_call_context = None
 
-def handle_tool_calls(tool_calls, session):
-    for tool_call in tool_calls:
-        function_name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
+    def apply_system_prompt(self):
+        if self.agent_manual_template:
+            current_date = datetime.datetime.now().strftime("%Y年%m月%d日")
+            agent_manual = self.agent_manual_template.replace("{{CURRENT_DATE}}", current_date)
+            self.session.set_system_prompt(agent_manual)
 
-        if function_name == "perform_web_search":
-            topic = arguments.get("topic")
-            print(f"LLM has decided to search for topics related to: \"{topic}\"")
-            session.add_message("tool", f"Proceeding with web search for topic: {topic}", tool_call_id=tool_call.id)
-            return send_message(session.messages, perform_search=True)
+    def get_history_text(self):
+        messages_to_render = [m for m in self.session.messages if m['role'] != 'system']
+        formatted_messages = []
+        for m in messages_to_render:
+            role = m['role']
+            if role == 'user':
+                role = 'You'
+            elif role == 'assistant':
+                role = 'LLM'
+            formatted_messages.append(f"{role.capitalize()}: {m['content']}")
+        return "\n".join(formatted_messages)
 
-        elif function_name == "execute_shell_command":
-            command = arguments.get("command")
-            tool_output = ""
-            if command:
-                print(f"\nLLM wants to execute the following command: `{command}`")
-                # Simplified approval for non-TUI interface
-                approval = input("Allow? [y/n]: ").lower()
-                if approval == 'y':
-                    try:
-                        print(f"Executing: {command}")
-                        result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=os.getcwd(), check=False)
-                        tool_output = f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
-                    except Exception as e:
-                        tool_output = f"Error executing command: {e}"
-                else:
-                    tool_output = "User denied command execution."
-            else:
-                tool_output = "LLM requested to execute an empty command."
-            
-            session.add_message("tool", tool_output, tool_call_id=tool_call.id)
-            return send_message(session.messages, perform_search=False)
-    return None
-
-def print_response(response_message):
-    response_content = response_message.content
-
-    if hasattr(response_message, 'annotations') and response_message.annotations:
-        print("--- Sources ---")
-        for i, annotation in enumerate(response_message.annotations, 1):
-            if hasattr(annotation, 'type') and annotation.type == 'url_citation':
-                citation = annotation.url_citation
-                print(f"{i}. {citation.title}: {citation.url}")
-        print("---------------\n")
-
-    print("LLM:", response_content)
-
-def chat_cli():
-    session = ChatSession()
-    
-    agent_manual_template = load_system_prompt()
-    
-    if agent_manual_template:
-        current_date = datetime.datetime.now().strftime("%Y年%m月%d日")
-        agent_manual = agent_manual_template.replace("{{CURRENT_DATE}}", current_date)
-        session.set_system_prompt(agent_manual)
-
-    print("New chat session started. Use '/chat save <name>', '/chat resume <name>', or '/chat new'.")
-    print("Press Alt+Enter for a new line. Press Enter to send. Press Ctrl+C or Ctrl+D to exit.")
-
-    bindings = KeyBindings()
-
-    @bindings.add('escape', 'enter')
-    def _(event):
-        event.current_buffer.insert_text('\n')
-
-    @bindings.add('enter')
-    def _(event):
-        event.current_buffer.validate_and_handle()
-
-    while True:
-        try:
-            user_input = prompt("You: ", multiline=True, key_bindings=bindings)
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            break
-
+    async def handle_input(self, user_input):
         if not user_input.strip():
-            continue
+            self.update_log()
+            return
 
-        # Handle session commands
         parts = user_input.strip().split()
         if parts[0].lower() == '/chat':
-            if len(parts) > 1:
-                command = parts[1].lower()
-                if command == 'save' and len(parts) > 2:
-                    session.session_name = parts[2]
-                    session.save()
-                    continue
-                elif command == 'resume' and len(parts) > 2:
-                    session = ChatSession(session_name=parts[2])
-                    session.load()
-                    if agent_manual_template: # Re-apply system prompt
-                        session.set_system_prompt(agent_manual)
-                    continue
-                elif command == 'new':
-                    session = ChatSession()
-                    if agent_manual_template: # Re-apply system prompt
-                        session.set_system_prompt(agent_manual)
-                    print("Started new chat session.")
-                    continue
-            print("Invalid command. Use: /chat save <name>, /chat resume <name>, or /chat new")
-            continue
+            self.handle_chat_command(parts)
+            self.update_log()
+            return
 
-        session.add_message("user", user_input)
-
-        response_message = send_message(session.messages, perform_search=False)
+        self.session.add_message("user", user_input)
+        self.update_log()
+        
+        response_message = send_message(self.session.messages, perform_search=False)
 
         if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
-            session.add_message("assistant", response_message.content or "", tool_calls=response_message.tool_calls)
-            response_message = handle_tool_calls(response_message.tool_calls, session)
+            self.session.add_message("assistant", response_message.content or "", tool_calls=response_message.tool_calls)
+            self.handle_tool_calls(response_message.tool_calls)
+        else:
+            if response_message:
+                self.session.add_message("assistant", response_message.content, annotations=getattr(response_message, 'annotations', None))
         
-        if response_message:
-            print_response(response_message)
-            session.add_message("assistant", response_message.content, annotations=getattr(response_message, 'annotations', None))
+        self.update_log()
+
+    def _process_shell_confirmation(self, choice: str):
+        tool_call = self._tool_call_context
+        if not tool_call:
+            return
+
+        command = json.loads(tool_call.function.arguments).get("command")
+        tool_output = ""
+
+        if choice == "allow":
+            try:
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=os.getcwd(), check=False)
+                tool_output = f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+            except Exception as e:
+                tool_output = f"Error executing command: {e}"
+        elif choice == "deny":
+            tool_output = "User denied command execution."
+        elif choice == "advise":
+            tool_output = "User has stopped the execution and requested advice on the command."
+        else:
+            tool_output = "User cancelled the operation."
+        
+        self.session.add_message("tool", tool_output, tool_call_id=tool_call.id)
+        
+        # Make the final call to the LLM
+        final_response = send_message(self.session.messages, perform_search=False)
+        if final_response:
+            self.session.add_message("assistant", final_response.content, annotations=getattr(final_response, 'annotations', None))
+        
+        self._tool_call_context = None
+        self.update_log()
+
+    def handle_tool_calls(self, tool_calls):
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+            arguments = json.loads(tool_call.function.arguments)
+
+            if function_name == "perform_web_search":
+                topic = arguments.get("topic")
+                self.session.add_message("tool", f"Proceeding with web search for topic: {topic}", tool_call_id=tool_call.id)
+                response = send_message(self.session.messages, perform_search=True)
+                if response:
+                    self.session.add_message("assistant", response.content, annotations=getattr(response, 'annotations', None))
+                self.update_log()
+
+            elif function_name == "execute_shell_command":
+                self._tool_call_context = tool_call
+                command = arguments.get("command")
+                self.app.confirm_shell(command, self._process_shell_confirmation)
+
+    def handle_chat_command(self, parts):
+        if len(parts) > 1:
+            command = parts[1].lower()
+            if command == 'save' and len(parts) > 2:
+                self.session.session_name = parts[2]
+                self.session.save()
+            elif command == 'resume' and len(parts) > 2:
+                self.session = ChatSession(session_name=parts[2])
+                self.session.load()
+                self.apply_system_prompt()
+            elif command == 'new':
+                self.session = ChatSession()
+                self.apply_system_prompt()
+
+    def update_log(self):
+        log_widget = self.app.query_one("#log")
+        log_widget.clear()
+        log_widget.write(self.get_history_text())
+
+def chat_cli():
+    chat_manager = ChatManager()
+    app = ChatApp(chat_manager)
+    app.run()
